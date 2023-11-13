@@ -77,7 +77,8 @@ impl WalCopier {
                 let crc = wal.checksum();
                 let mut buf = [0u8; 12];
                 buf[0..4].copy_from_slice(page_size.to_be_bytes().as_slice());
-                buf[4..].copy_from_slice(crc.to_be_bytes().as_slice());
+                buf[4..8].copy_from_slice(crc.0.to_be_bytes().as_slice());
+                buf[8..].copy_from_slice(crc.1.to_be_bytes().as_slice());
                 buf
             };
             meta_file.write_all(buf.as_ref()).await?;

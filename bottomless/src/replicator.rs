@@ -2,7 +2,7 @@ use crate::backup::WalCopier;
 use crate::read::BatchReader;
 use crate::transaction_cache::TransactionPageCache;
 use crate::uuid_utils::decode_unix_timestamp;
-use crate::wal::WalFileReader;
+use crate::wal::{Checksum, WalFileReader};
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwapOption;
 use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
@@ -1251,7 +1251,7 @@ impl Replicator {
         generation: &Uuid,
         page_size: usize,
         last_consistent_frame: Option<u32>,
-        mut checksum: u64,
+        mut checksum: Checksum,
         utc_time: Option<NaiveDateTime>,
         db: &mut File,
     ) -> Result<bool> {
@@ -1499,18 +1499,20 @@ impl Replicator {
         None
     }
 
-    async fn store_metadata(&self, page_size: u32, crc: u64) -> Result<()> {
+    async fn store_metadata(&self, page_size: u32, crc: Checksum) -> Result<()> {
         let generation = self.generation()?;
         let key = format!("{}-{}/.meta", self.db_name, generation);
         tracing::debug!(
-            "Storing metadata at '{}': page size - {}, crc - {}",
+            "Storing metadata at '{}': page size - {}, crc - {:X}{:X}",
             key,
             page_size,
-            crc
+            crc.0,
+            crc.1
         );
         let mut body = Vec::with_capacity(12);
         body.extend_from_slice(page_size.to_be_bytes().as_slice());
-        body.extend_from_slice(crc.to_be_bytes().as_slice());
+        body.extend_from_slice(crc.0.to_be_bytes().as_slice());
+        body.extend_from_slice(crc.1.to_be_bytes().as_slice());
         let _ = self
             .client
             .put_object()
@@ -1522,7 +1524,7 @@ impl Replicator {
         Ok(())
     }
 
-    pub async fn get_metadata(&self, generation: &Uuid) -> Result<Option<(u32, u64)>> {
+    pub async fn get_metadata(&self, generation: &Uuid) -> Result<Option<(u32, Checksum)>> {
         let key = format!("{}-{}/.meta", self.db_name, generation);
         if let Ok(obj) = self
             .client
@@ -1534,8 +1536,9 @@ impl Replicator {
         {
             let mut data = obj.body.collect().await?;
             let page_size = data.get_u32();
-            let crc = data.get_u64();
-            Ok(Some((page_size, crc)))
+            let crc0 = data.get_u32();
+            let crc1 = data.get_u32();
+            Ok(Some((page_size, (crc0, crc1))))
         } else {
             Ok(None)
         }

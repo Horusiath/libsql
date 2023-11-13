@@ -37,14 +37,13 @@ impl WalFrameHeader {
         ])
     }
 
-    pub fn crc(&self) -> u64 {
-        u64::from_be_bytes([
-            self.0[16], self.0[17], self.0[18], self.0[19], self.0[20], self.0[21], self.0[22],
-            self.0[23],
-        ])
+    pub fn crc(&self) -> (u32, u32) {
+        let s0: [u8; 4] = self.0[16..20].try_into().unwrap();
+        let s1: [u8; 4] = self.0[20..24].try_into().unwrap();
+        (u32::from_be_bytes(s0), u32::from_be_bytes(s1))
     }
 
-    pub fn verify(&self, init_crc: u64, page_data: &[u8]) -> Result<u64> {
+    pub fn verify(&self, init_crc: (u32, u32), page_data: &[u8]) -> Result<Checksum> {
         let mut crc = init_crc;
         crc = checksum_be(crc, &self.0[0..8]);
         crc = checksum_be(crc, page_data);
@@ -53,10 +52,12 @@ impl WalFrameHeader {
             Ok(crc)
         } else {
             Err(anyhow!(
-                "Frame checksum verification failed for page no. {}. Expected: {:X}. Got: {:X}",
+                "Frame checksum verification failed for page no. {}. Expected: {:X}{:X}. Got: {:X}{:X}",
                 self.pgno(),
-                frame_crc,
-                crc
+                frame_crc.0,
+                frame_crc.1,
+                crc.0,
+                crc.1
             ))
         }
     }
@@ -80,6 +81,9 @@ impl AsRef<[u8]> for WalFrameHeader {
     }
 }
 
+/// SQLite WAL checksum.
+pub type Checksum = (u32, u32);
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct WalHeader {
@@ -96,7 +100,7 @@ pub(crate) struct WalHeader {
     /// A different random integer changing with each checkpoint
     pub salt_2: u32,
     /// Checksum for first 24 bytes of header
-    pub crc: u64,
+    pub crc: Checksum,
 }
 
 impl WalHeader {
@@ -112,7 +116,10 @@ impl From<[u8; WalHeader::SIZE as usize]> for WalHeader {
             checkpoint_seq_no: u32::from_be_bytes([v[12], v[13], v[14], v[15]]),
             salt_1: u32::from_be_bytes([v[16], v[17], v[18], v[19]]),
             salt_2: u32::from_be_bytes([v[20], v[21], v[22], v[23]]),
-            crc: u64::from_be_bytes([v[24], v[25], v[26], v[27], v[28], v[29], v[30], v[31]]),
+            crc: (
+                u32::from_be_bytes([v[24], v[25], v[26], v[27]]),
+                u32::from_be_bytes([v[28], v[29], v[30], v[31]]),
+            ),
         }
     }
 }
@@ -143,7 +150,7 @@ impl WalFileReader {
         self.header.page_size
     }
 
-    pub fn checksum(&self) -> u64 {
+    pub fn checksum(&self) -> Checksum {
         self.header.crc
     }
 
@@ -241,18 +248,19 @@ impl AsMut<File> for WalFileReader {
 
 /// Generate or extend an 8 byte checksum based on the data in
 ///the `page` and the `init` value. `page` size must be multiple of 8.
-pub fn checksum_be(init: u64, page: &[u8]) -> u64 {
+pub fn checksum_be(init: Checksum, page: &[u8]) -> Checksum {
     debug_assert_eq!(page.len() % 8, 0);
-    let mut s1 = (init >> 32) as u32;
-    let mut s2 = (init & u32::MAX as u64) as u32;
-    let page = unsafe { std::slice::from_raw_parts(page.as_ptr() as *const u32, page.len() / 4) };
+    let (mut s0, mut s1) = init;
     let mut i = 0;
+    let page = unsafe { std::slice::from_raw_parts(page.as_ptr() as *const u32, page.len() / 4) };
     while i < page.len() {
-        s1 = s1.wrapping_add(page[i]).wrapping_add(s2);
-        s2 = s2.wrapping_add(page[i + 1]).wrapping_add(s1);
+        let curr = page[i];
+        s0 = s0.wrapping_add(curr.to_be()).wrapping_add(s1);
+        let curr = page[i + 1];
+        s1 = s1.wrapping_add(curr.to_be()).wrapping_add(s0);
         i += 2;
     }
-    ((s1 as u64) << 32) | (s2 as u64)
+    (s0, s1)
 }
 
 #[cfg(test)]
@@ -273,7 +281,7 @@ mod test {
             checkpoint_seq_no: 0,
             salt_1: 3188076412,
             salt_2: 666853980,
-            crc: 5842868361513443485,
+            crc: (1360398801, 1700831389),
         };
         let actual = WalHeader::from(source);
         assert_eq!(actual, expected);
