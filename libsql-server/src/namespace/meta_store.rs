@@ -1,3 +1,4 @@
+use async_lock::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -11,17 +12,24 @@ use libsql_sys::wal::{
 };
 use parking_lot::Mutex;
 use prost::Message;
+use rusqlite::params;
 use tokio::sync::{
     mpsc,
     watch::{self, Receiver, Sender},
 };
 
+use crate::auth::{Authenticated, Authorized, Permission};
 use crate::connection::config::DatabaseConfig;
+use crate::connection::Connection as DbConn;
+use crate::database::Database;
+use crate::namespace::MakeNamespace;
+use crate::query::{Params, Value};
+use crate::query_result_builder::QueryResultBuilder;
 use crate::{
     config::MetaStoreConfig, connection::libsql::open_conn_active_checkpoint, error::Error, Result,
 };
 
-use super::NamespaceName;
+use super::{NamespaceBottomlessDbId, NamespaceName, NamespaceStore, RestoreOption};
 
 type ChangeMsg = (NamespaceName, Arc<DatabaseConfig>);
 type WalManager = WalWrapper<Option<BottomlessWalWrapper>, Sqlite3WalManager>;
@@ -314,6 +322,39 @@ impl MetaStore {
     pub fn namespace_names(&self) -> Vec<NamespaceName> {
         self.inner.lock().configs.keys().cloned().collect()
     }
+
+    pub fn prepare_job(&self, job_id: String, sql: String) -> Result<Job> {
+        let mut inner = self.inner.lock();
+        let namespaces: Vec<_> = inner.configs.keys().cloned().collect();
+
+        inner.conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS libsql_jobs(
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     job_id TEXT UNIQUE NOT NULL, 
+                     script TEXT NOT NULL);
+                   CRATE TABLE IF NOT EXISTS libsql_job_progress(
+                     job_id INTEGER NOT NULL,
+                     namespace TEXT NOT NULL,
+                     status INTEGER,
+                     err_msg TEXT,
+                     PRIMARY KEY(job_id, namespace),
+                     FOREIGN KEY(job_id) REFERENCES libsql_jobs(id));
+                     "#,
+        )?;
+        let tx = inner.conn.transaction()?;
+        let id = tx.execute(
+            "INSERT INTO libsql_jobs(job_id, script) VALUES (?,?) RETURNING id;",
+            [&job_id, &sql],
+        )? as u32;
+        {
+            let mut prep_stmt = tx.prepare("INSERT INTO libsql_job_progress(job_id, namespace, status, err_msg) VALUES (?,?, NULL, NULL)")?;
+            for namespace in namespaces.iter() {
+                prep_stmt.execute(params![id, namespace.as_str()])?;
+            }
+        }
+        tx.commit()?;
+        Job::new(job_id, sql, namespaces)
+    }
 }
 
 impl MetaStoreHandle {
@@ -390,4 +431,103 @@ impl MetaStoreHandle {
 
         Ok(())
     }
+}
+
+const JOB_STATUS_SUCCESS: u32 = 0;
+const JOB_STATUS_FAILURE: u32 = 1;
+
+#[derive(Debug)]
+pub struct Job {
+    pub job_id: String,
+    batch: Vec<crate::query::Query>,
+    pub namespaces: Vec<NamespaceName>,
+}
+
+impl Job {
+    pub fn new(job_id: String, sql: String, namespaces: Vec<NamespaceName>) -> Result<Self> {
+        let mut batch = Vec::new();
+        batch.push(
+            query("CREATE TABLE IF NOT EXISTS libsql_jobs(job_id TEXT NOT NULL PRIMARY KEY, status INTEGER);", Params::empty())?
+        );
+        batch.push(query("BEGIN", Params::empty())?);
+        batch.push(query(
+            "INSERT INTO libsql_jobs(job_id, status) VALUES(?, NULL);",
+            Params::new_positional(vec![Value::Text(job_id.clone())]),
+        )?);
+        for stmt in crate::query_analysis::Statement::parse(&sql) {
+            batch.push(crate::query::Query {
+                stmt: stmt?,
+                params: crate::query::Params::empty(),
+                want_rows: true,
+            });
+        }
+        Ok(Job {
+            job_id,
+            batch,
+            namespaces,
+        })
+    }
+    pub async fn execute<N, B>(&self, ns_store: &NamespaceStore<N>, builder: &mut B) -> Result<()>
+    where
+        N: MakeNamespace,
+        B: QueryResultBuilder,
+    {
+        for ns_name in self.namespaces {
+            tracing::trace!("Executing job `{}` on {}", self.job_id, ns_name.as_str());
+            let entry = ns_store
+                .inner
+                .store
+                .try_get_with(ns_name.clone(), async {
+                    let ns = ns_store
+                        .inner
+                        .make_namespace
+                        .create(
+                            ns_name.clone(),
+                            RestoreOption::Latest,
+                            NamespaceBottomlessDbId::NotProvided,
+                            ns_store.make_reset_cb(),
+                            &ns_store.inner.metadata,
+                        )
+                        .await?;
+                    tracing::info!("loaded namespace: `{}`", ns_name.as_str());
+                    Ok::<_, crate::error::Error>(Arc::new(RwLock::new(Some(ns))))
+                })
+                .await?;
+            let lock = entry.read().await;
+            let auth = Authenticated::Authorized(Authorized {
+                namespace: None,
+                permission: Permission::FullAccess,
+            });
+            if let Some(ns) = &*lock {
+                let conn = ns.db.connection_maker().create().await?;
+
+                let result = conn
+                    .execute_batch(self.batch.clone(), auth.clone(), builder, None)
+                    .await;
+
+                match result {
+                    Ok(res) => {
+                        todo!();
+                        *builder = *res;
+                    }
+                    Err(e) => {
+                        conn.rollback(auth.clone())?;
+                        todo!();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn query(sql: &str, params: crate::query::Params) -> crate::Result<crate::query::Query> {
+    let params = params.into_params()?;
+    Ok(crate::query::Query {
+        stmt: crate::query_analysis::Statement::parse(sql)
+            .next()
+            .unwrap()?,
+        params,
+        want_rows: false,
+    })
 }

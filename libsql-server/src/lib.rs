@@ -212,6 +212,7 @@ where
         } else {
             interval.tick().await;
         }
+        println!("CHECKPOINT TICK");
         retry = match connection_maker.create().await {
             Ok(conn) => {
                 if let Err(e) = conn.vacuum_if_needed().await {

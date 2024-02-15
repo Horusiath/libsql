@@ -202,7 +202,10 @@ async fn handle_execute_on_all<M: MakeNamespace, C: Connector>(
     State(app_state): State<Arc<AppState<M, C>>>,
     Json(req): Json<ExecuteOnAllReq>,
 ) -> crate::Result<Vec<u8>> {
-    let ret = app_state.namespaces.execute_for_each(req.sql).await?;
+    let ret = app_state
+        .namespaces
+        .execute_for_each(req.job_id, req.sql)
+        .await?;
 
     Ok(ret)
 }
@@ -289,6 +292,7 @@ struct CreateNamespaceReq {
 
 #[derive(Debug, Deserialize)]
 struct ExecuteOnAllReq {
+    job_id: String,
     sql: String,
 }
 

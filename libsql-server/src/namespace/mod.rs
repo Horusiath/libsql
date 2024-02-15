@@ -20,7 +20,7 @@ use libsql_replication::rpc::replication::replication_log_client::ReplicationLog
 use libsql_sys::wal::{Sqlite3WalManager, WalManager};
 use moka::future::Cache;
 use parking_lot::Mutex;
-use rusqlite::ErrorCode;
+use rusqlite::{params, ErrorCode};
 use serde::de::Visitor;
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
@@ -51,6 +51,7 @@ use crate::{
 };
 
 use crate::namespace::fork::PointInTimeRestore;
+use crate::query::{Params, Value};
 pub use fork::ForkError;
 
 use self::fork::ForkTask;
@@ -770,51 +771,12 @@ impl<M: MakeNamespace> NamespaceStore<M> {
 
     pub(crate) async fn execute_for_each(
         &self,
+        job_id: String,
         sql: String,
     ) -> crate::Result<<ReusableBuilder<JsonHttpPayloadBuilder> as QueryResultBuilder>::Ret> {
+        let job = self.inner.metadata.prepare_job(job_id, sql)?;
         let mut json_builder = ReusableBuilder::new(JsonHttpPayloadBuilder::new());
-        for ns_name in self.inner.metadata.namespace_names() {
-            tracing::trace!("Executing {sql} on {}", ns_name.as_str());
-            let entry = self
-                .inner
-                .store
-                .try_get_with(ns_name.clone(), async {
-                    let ns = self
-                        .inner
-                        .make_namespace
-                        .create(
-                            ns_name.clone(),
-                            RestoreOption::Latest,
-                            NamespaceBottomlessDbId::NotProvided,
-                            self.make_reset_cb(),
-                            &self.inner.metadata,
-                        )
-                        .await?;
-                    tracing::info!("loaded namespace: `{}`", ns_name.as_str());
-                    Ok::<_, crate::error::Error>(Arc::new(RwLock::new(Some(ns))))
-                })
-                .await?;
-            let lock = entry.read().await;
-            if let Some(ns) = &*lock {
-                let conn = ns.db.connection_maker().create().await?;
-                let batch = crate::query_analysis::Statement::parse(&sql)
-                    .map(|stmt| {
-                        stmt.map(|stmt| crate::query::Query {
-                            stmt: stmt,
-                            params: crate::query::Params::empty(),
-                            want_rows: true,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let auth = Authenticated::Authorized(Authorized {
-                    namespace: None,
-                    permission: Permission::FullAccess,
-                });
-                json_builder = conn
-                    .execute_batch_or_rollback(batch, auth, json_builder, None)
-                    .await?;
-            }
-        }
+        job.execute(&self, &mut json_builder).await?;
         Ok(json_builder.into_ret())
     }
 }
