@@ -20,7 +20,6 @@ use libsql_replication::rpc::replication::replication_log_client::ReplicationLog
 use libsql_sys::wal::{Sqlite3WalManager, WalManager};
 use moka::future::Cache;
 use parking_lot::Mutex;
-use rusqlite::{params, ErrorCode};
 use serde::de::Visitor;
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
@@ -31,7 +30,7 @@ use tokio_util::io::StreamReader;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::auth::{parse_jwt_key, Authenticated, Authorized, Permission};
+use crate::auth::{parse_jwt_key, Authenticated};
 use crate::config::MetaStoreConfig;
 use crate::connection::config::DatabaseConfig;
 use crate::connection::libsql::{open_conn, MakeLibSqlConn};
@@ -40,9 +39,8 @@ use crate::connection::Connection;
 use crate::connection::MakeConnection;
 use crate::database::{Database, PrimaryDatabase, ReplicaDatabase};
 use crate::error::{Error, LoadDumpError};
-use crate::http::user::JsonHttpPayloadBuilder;
 use crate::metrics::NAMESPACE_LOAD_LATENCY;
-use crate::query_result_builder::{QueryResultBuilder, ReusableBuilder};
+use crate::query_result_builder::QueryResultBuilder;
 use crate::replication::{FrameNo, NamespacedSnapshotCallback, ReplicationLogger};
 use crate::stats::Stats;
 use crate::{
@@ -51,8 +49,9 @@ use crate::{
 };
 
 use crate::namespace::fork::PointInTimeRestore;
-use crate::query::{Params, Value};
+use crate::namespace::meta_store::Job;
 pub use fork::ForkError;
+use rusqlite::ErrorCode;
 
 use self::fork::ForkTask;
 use self::meta_store::{MetaStore, MetaStoreHandle};
@@ -769,15 +768,10 @@ impl<M: MakeNamespace> NamespaceStore<M> {
         self.with(namespace, |ns| ns.db_config_store.clone()).await
     }
 
-    pub(crate) async fn execute_for_each(
-        &self,
-        job_id: String,
-        sql: String,
-    ) -> crate::Result<<ReusableBuilder<JsonHttpPayloadBuilder> as QueryResultBuilder>::Ret> {
-        let job = self.inner.metadata.prepare_job(job_id, sql)?;
-        let mut json_builder = ReusableBuilder::new(JsonHttpPayloadBuilder::new());
-        job.execute(&self, &mut json_builder).await?;
-        Ok(json_builder.into_ret())
+    pub(crate) async fn execute_for_each(&self, job_id: String, sql: String) -> crate::Result<Job> {
+        let mut job = self.inner.metadata.prepare_job(job_id, sql)?;
+        job.execute(&self).await?;
+        Ok(job)
     }
 }
 

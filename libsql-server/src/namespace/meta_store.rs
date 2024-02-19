@@ -17,6 +17,7 @@ use tokio::sync::{
     mpsc,
     watch::{self, Receiver, Sender},
 };
+use tokio_stream::StreamExt;
 
 use crate::auth::{Authenticated, Authorized, Permission};
 use crate::connection::config::DatabaseConfig;
@@ -24,7 +25,7 @@ use crate::connection::Connection as DbConn;
 use crate::database::Database;
 use crate::namespace::MakeNamespace;
 use crate::query::{Params, Value};
-use crate::query_result_builder::QueryResultBuilder;
+use crate::query_result_builder::{IgnoreResult, QueryResultBuilder};
 use crate::{
     config::MetaStoreConfig, connection::libsql::open_conn_active_checkpoint, error::Error, Result,
 };
@@ -325,7 +326,11 @@ impl MetaStore {
 
     pub fn prepare_job(&self, job_id: String, sql: String) -> Result<Job> {
         let mut inner = self.inner.lock();
-        let namespaces: Vec<_> = inner.configs.keys().cloned().collect();
+        let mut namespaces: HashMap<_, _> = inner
+            .configs
+            .keys()
+            .map(|ns| (ns.clone(), JobStatus::Pending))
+            .collect();
 
         inner.conn.execute_batch(
             r#"CREATE TABLE IF NOT EXISTS libsql_jobs(
@@ -343,17 +348,32 @@ impl MetaStore {
         )?;
         let tx = inner.conn.transaction()?;
         let id = tx.execute(
-            "INSERT INTO libsql_jobs(job_id, script) VALUES (?,?) RETURNING id;",
+            "INSERT INTO libsql_jobs(job_id, script) VALUES (?,?) ON CONFLICT(job_id) DO NOTHING RETURNING id;",
             [&job_id, &sql],
         )? as u32;
         {
-            let mut prep_stmt = tx.prepare("INSERT INTO libsql_job_progress(job_id, namespace, status, err_msg) VALUES (?,?, NULL, NULL)")?;
-            for namespace in namespaces.iter() {
-                prep_stmt.execute(params![id, namespace.as_str()])?;
+            let mut query_job =
+                tx.prepare(r#"SELECT status, err_msg FROM libsql_job_progress WHERE job_id = ?"#)?;
+            let mut insert_job = tx.prepare(r#"INSERT INTO libsql_job_progress(job_id, namespace, status, err_msg) VALUES (?,?, NULL, NULL)"#)?;
+            for (ns, res) in namespaces.iter_mut() {
+                let mut rows = query_job.query(params![id])?;
+                match rows.next()? {
+                    None => {
+                        insert_job.execute(params![id, ns.as_str()])?;
+                    }
+                    Some(row) => match row.get_unwrap(0) {
+                        0 => *res = JobStatus::Finished,
+                        1 => {
+                            let err_msg = row.get_unwrap(1);
+                            *res = JobStatus::Failed(err_msg);
+                        }
+                        _ => unreachable!(),
+                    },
+                }
             }
         }
         tx.commit()?;
-        Job::new(job_id, sql, namespaces)
+        Job::new(id, job_id, sql, namespaces)
     }
 }
 
@@ -433,47 +453,104 @@ impl MetaStoreHandle {
     }
 }
 
-const JOB_STATUS_SUCCESS: u32 = 0;
-const JOB_STATUS_FAILURE: u32 = 1;
+const JOB_STATUS_SUCCESS: i64 = 0;
+const JOB_STATUS_FAILURE: i64 = 1;
+
+#[derive(Debug)]
+pub enum JobStatus {
+    Pending,
+    Finished,
+    Failed(String),
+}
 
 #[derive(Debug)]
 pub struct Job {
-    pub job_id: String,
-    batch: Vec<crate::query::Query>,
-    pub namespaces: Vec<NamespaceName>,
+    id: u32,
+    pub name: String,
+    pub sql: String,
+    pub namespaces: HashMap<NamespaceName, JobStatus>,
 }
 
 impl Job {
-    pub fn new(job_id: String, sql: String, namespaces: Vec<NamespaceName>) -> Result<Self> {
-        let mut batch = Vec::new();
-        batch.push(
-            query("CREATE TABLE IF NOT EXISTS libsql_jobs(job_id TEXT NOT NULL PRIMARY KEY, status INTEGER);", Params::empty())?
-        );
-        batch.push(query("BEGIN", Params::empty())?);
-        batch.push(query(
-            "INSERT INTO libsql_jobs(job_id, status) VALUES(?, NULL);",
-            Params::new_positional(vec![Value::Text(job_id.clone())]),
-        )?);
-        for stmt in crate::query_analysis::Statement::parse(&sql) {
-            batch.push(crate::query::Query {
-                stmt: stmt?,
-                params: crate::query::Params::empty(),
-                want_rows: true,
-            });
-        }
+    pub fn new(
+        id: u32,
+        name: String,
+        sql: String,
+        namespaces: HashMap<NamespaceName, JobStatus>,
+    ) -> Result<Self> {
         Ok(Job {
-            job_id,
-            batch,
+            id,
+            name,
+            sql,
             namespaces,
         })
     }
-    pub async fn execute<N, B>(&self, ns_store: &NamespaceStore<N>, builder: &mut B) -> Result<()>
+
+    fn sql_init_job(job_id: String) -> Result<Vec<crate::query::Query>> {
+        let mut batch = Vec::with_capacity(2);
+        batch.push(
+            query("CREATE TABLE IF NOT EXISTS libsql_jobs(job_id TEXT NOT NULL PRIMARY KEY, status INTEGER, err_msg TEXT);", Params::empty())?
+        );
+        batch.push(query(
+            "INSERT INTO libsql_jobs(job_id, status, err_msg) VALUES(?, NULL, NULL);",
+            Params::new_positional(vec![Value::Text(job_id)]),
+        )?);
+        Ok(batch)
+    }
+
+    fn sql_wrap_job(job_id: String, sql: &str) -> Result<Vec<crate::query::Query>> {
+        let mut batch = Vec::new();
+        batch.push(query("BEGIN;", Params::empty())?);
+        for stmt in crate::query_analysis::Statement::parse(sql) {
+            batch.push(crate::query::Query {
+                stmt: stmt?,
+                params: crate::query::Params::empty(),
+                want_rows: false,
+            });
+        }
+        batch.push(query(
+            "UPDATE libsql_jobs WHERE job_id = ? SET status = ?",
+            Params::new_positional(vec![
+                Value::Text(job_id),
+                Value::Integer(JOB_STATUS_SUCCESS),
+            ]),
+        )?);
+        batch.push(query("COMMIT;", Params::empty())?);
+        Ok(batch)
+    }
+
+    pub async fn execute<N>(&mut self, ns_store: &NamespaceStore<N>) -> Result<()>
     where
         N: MakeNamespace,
-        B: QueryResultBuilder,
     {
-        for ns_name in self.namespaces {
-            tracing::trace!("Executing job `{}` on {}", self.job_id, ns_name.as_str());
+        // Step 1: parse script and wrap it with status update and transaction.
+        let init_batch = Self::sql_init_job(self.name.clone())?;
+        let exec_job = Self::sql_wrap_job(self.name.clone(), &self.sql)?;
+
+        // Step 2: go over all the namespaces
+        let meta = ns_store.inner.metadata.inner.lock();
+        for (ns_name, prev_result) in self.namespaces.iter_mut() {
+            match prev_result {
+                JobStatus::Failed(err_msg) => {
+                    tracing::info!(
+                        "Retrying job `{}` on {}. Previously failed due to: {}",
+                        self.name,
+                        ns_name.as_str(),
+                        err_msg
+                    )
+                }
+                JobStatus::Pending => {
+                    tracing::info!("Executing job `{}` on {}", self.name, ns_name.as_str())
+                }
+                JobStatus::Finished => {
+                    tracing::info!(
+                        "Skipping finihed job `{}` on {}",
+                        self.name,
+                        ns_name.as_str()
+                    );
+                    continue;
+                }
+            }
             let entry = ns_store
                 .inner
                 .store
@@ -489,7 +566,7 @@ impl Job {
                             &ns_store.inner.metadata,
                         )
                         .await?;
-                    tracing::info!("loaded namespace: `{}`", ns_name.as_str());
+                    tracing::trace!("loaded namespace: `{}`", ns_name.as_str());
                     Ok::<_, crate::error::Error>(Arc::new(RwLock::new(Some(ns))))
                 })
                 .await?;
@@ -500,19 +577,47 @@ impl Job {
             });
             if let Some(ns) = &*lock {
                 let conn = ns.db.connection_maker().create().await?;
+                // Step 3: register job to be executed
+                conn.execute_batch(init_batch.clone(), auth.clone(), IgnoreResult, None)
+                    .await?;
 
+                // Step 4: execute job and update status
                 let result = conn
-                    .execute_batch(self.batch.clone(), auth.clone(), builder, None)
+                    .execute_batch(exec_job.clone(), auth.clone(), IgnoreResult, None)
                     .await;
 
                 match result {
                     Ok(res) => {
-                        todo!();
-                        *builder = *res;
+                        // Step 5a: success, already committed
+                        meta.conn.execute("UPDATE libsql_job_progress SET = status = ?, err_msg = NULL WHERE job_id = ?", params![JOB_STATUS_SUCCESS, self.id])?;
                     }
                     Err(e) => {
-                        conn.rollback(auth.clone())?;
-                        todo!();
+                        // Step 5b: failure - try to update job status
+                        let err_msg = e.to_string();
+                        let res = conn
+                            .execute_batch(
+                                vec![query(
+                                    "UPDATE libsql_jobs WHERE job_id = ? SET status = ?, err_msg = ?;",
+                                    Params::new_positional(vec![
+                                        Value::Text(self.name.clone()),
+                                        Value::Integer(JOB_STATUS_FAILURE),
+                                        Value::Text(err_msg.clone())
+                                    ]),
+                                )?],
+                                auth.clone(),
+                                IgnoreResult,
+                                None,
+                            )
+                            .await; // best effort
+                        if let Err(e2) = res {
+                            tracing::error!(
+                                "failed to update libsql_jobs with failure status `{}` due to `{}`",
+                                e,
+                                e2
+                            )
+                        }
+                        meta.conn.execute("UPDATE libsql_job_progress SET = status = ?, err_msg = ? WHERE job_id = ?", 
+                                          params![JOB_STATUS_FAILURE, err_msg, self.id])?;
                     }
                 }
             }
@@ -522,7 +627,6 @@ impl Job {
 }
 
 fn query(sql: &str, params: crate::query::Params) -> crate::Result<crate::query::Query> {
-    let params = params.into_params()?;
     Ok(crate::query::Query {
         stmt: crate::query_analysis::Statement::parse(sql)
             .next()
