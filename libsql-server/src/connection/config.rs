@@ -22,6 +22,10 @@ pub struct DatabaseConfig {
     pub txn_timeout: Option<Duration>,
     #[serde(default)]
     pub allow_attach: bool,
+    #[serde(default)]
+    pub is_shared_schema: bool,
+    #[serde(default)]
+    pub shared_schema_name: Option<String>,
 }
 
 const fn default_max_size() -> u64 {
@@ -40,6 +44,8 @@ impl Default for DatabaseConfig {
             jwt_key: None,
             txn_timeout: Some(TXN_TIMEOUT),
             allow_attach: false,
+            is_shared_schema: false,
+            shared_schema_name: None,
         }
     }
 }
@@ -56,6 +62,8 @@ impl From<&metadata::DatabaseConfig> for DatabaseConfig {
             jwt_key: value.jwt_key.clone(),
             txn_timeout: value.txn_timeout_s.map(Duration::from_secs),
             allow_attach: value.allow_attach,
+            is_shared_schema: value.is_shared_schema,
+            shared_schema_name: value.shared_schema_name.clone(),
         }
     }
 }
@@ -72,6 +80,8 @@ impl From<&DatabaseConfig> for metadata::DatabaseConfig {
             jwt_key: value.jwt_key.clone(),
             txn_timeout_s: value.txn_timeout.map(|d| d.as_secs()),
             allow_attach: value.allow_attach,
+            is_shared_schema: value.is_shared_schema,
+            shared_schema_name: value.shared_schema_name.clone(),
         }
     }
 }

@@ -23,4 +23,8 @@ pub struct DatabaseConfig {
     pub txn_timeout_s: ::core::option::Option<u64>,
     #[prost(bool, tag = "9")]
     pub allow_attach: bool,
+    #[prost(bool, tag = "10")]
+    pub is_shared_schema: bool,
+    #[prost(string, optional, tag = "11")]
+    pub shared_schema_name: ::core::option::Option<::prost::alloc::string::String>,
 }
